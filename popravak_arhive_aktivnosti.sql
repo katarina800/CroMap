@@ -15,13 +15,13 @@
 --  Skripta je idempotentna: smije se pokrenuti više puta.
 --  Pokreće se JEDNOM nad produkcijskom bazom, npr.:
 --      psql "<Render External Database URL>" -f popravak_arhive_aktivnosti.sql
--- ============================================================================
+-- ============================================ser_date_uidx
+    ON activity_logs (user_id, date);================================
 
 BEGIN;
 
 -- ─── 0. Sigurnosna provjera: ON CONFLICT (user_id, date) traži ovaj indeks ──
-CREATE UNIQUE INDEX IF NOT EXISTS activity_logs_user_date_uidx
-    ON activity_logs (user_id, date);
+CREATE UNIQUE INDEX IF NOT EXISTS activity_logs_u
 
 -- ─── 1. Vrati funkcije koje broje lajkove i komentare ───────────────────────
 CREATE OR REPLACE FUNCTION track_like_activity()
