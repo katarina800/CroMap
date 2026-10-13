@@ -16,7 +16,7 @@ namespace CroMap.Repositories
             _logger = logger;
         }
 
-        public async Task RegisterAsync(User user)
+        public async Task<int> RegisterAsync(User user)
         {
             using var connection = _dbConnection.CreateConnection();
 
@@ -26,9 +26,10 @@ namespace CroMap.Repositories
 
             var sql = @"
         INSERT INTO users (username, first_name, last_name, email, phone, password_hash, birth_date, language, created_at)
-        VALUES (@Username, @FirstName, @LastName, @Email, @Phone, @PasswordHash, @BirthDate, @Language, @CreatedAt)";
+        VALUES (@Username, @FirstName, @LastName, @Email, @Phone, @PasswordHash, @BirthDate, @Language, @CreatedAt)
+        RETURNING id";
 
-            await connection.ExecuteAsync(sql, new
+            var newId = await connection.ExecuteScalarAsync<int>(sql, new
             {
                 user.Username,
                 user.FirstName,
@@ -44,6 +45,7 @@ namespace CroMap.Repositories
             });
 
             _logger.LogInformation($"✅ User registered: {user.Username}");
+            return newId;
         }
 
         // 🔥 DODAJ OVU METODU ZA LOGIN PO USERNAME
@@ -66,7 +68,8 @@ namespace CroMap.Repositories
             password_hash AS PasswordHash, 
             birth_date AS BirthDate, 
             created_at AS CreatedAt,
-            is_admin AS IsAdmin
+            is_admin AS IsAdmin,
+            email_verified AS EmailVerified
         FROM users 
         WHERE LOWER(username) = LOWER(@Username)";
 
@@ -129,6 +132,39 @@ namespace CroMap.Repositories
                 "SELECT COUNT(*) FROM users WHERE LOWER(username) = LOWER(@Username)",
                 new { Username = username });
             return count > 0;
+        }
+
+        /// <summary>
+        /// Briše lokalni račun s ovom adresom koji još nije potvrđen. Potvrđeni,
+        /// Google i administratorski računi se nikad ne diraju.
+        /// </summary>
+        public async Task<int> DeleteUnverifiedByEmailAsync(string email)
+        {
+            using var connection = _dbConnection.CreateConnection();
+            return await connection.ExecuteAsync(
+                @"DELETE FROM users
+                  WHERE LOWER(email) = LOWER(@Email)
+                    AND email_verified = FALSE
+                    AND google_id IS NULL
+                    AND is_admin = FALSE",
+                new { Email = email });
+        }
+
+        /// <summary>
+        /// Briše lokalni račun s ovim korisničkim imenom koji je neprovjeren i stariji
+        /// od 10 minuta (korisnik je vjerojatno pogriješio u e-mail adresi).
+        /// </summary>
+        public async Task<int> DeleteStaleUnverifiedByUsernameAsync(string username)
+        {
+            using var connection = _dbConnection.CreateConnection();
+            return await connection.ExecuteAsync(
+                @"DELETE FROM users
+                  WHERE LOWER(username) = LOWER(@Username)
+                    AND email_verified = FALSE
+                    AND google_id IS NULL
+                    AND is_admin = FALSE
+                    AND created_at < @Cutoff",
+                new { Username = username, Cutoff = DateTime.UtcNow.AddMinutes(-10) });
         }
 
         public async Task<bool> EmailExistsAsync(string email)

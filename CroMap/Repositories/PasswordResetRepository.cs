@@ -1,121 +1,80 @@
 // Repositories/PasswordResetRepository.cs
 using System.Security.Cryptography;
-using System.Text;
 using CroMap.Data;
 using Dapper;
 
 namespace CroMap.Repositories
 {
-    public class PasswordResetRepository
+    /// <summary>
+    /// Kodovi za reset lozinke. Tijek: kod (6 znamenki, e-mailom) → provjera koda
+    /// na poslužitelju → jednokratna dozvola (<c>resetToken</c>, 256 bita) →
+    /// promjena lozinke samo uz tu dozvolu.
+    /// </summary>
+    public class PasswordResetRepository : OneTimeCodeRepository
     {
-        private readonly DatabaseConnection _db;
-        private readonly byte[] _hmacKey;
+        private static readonly TimeSpan TicketLifetime = TimeSpan.FromMinutes(10);
 
-        /// <summary>Najviše ovoliko pogrešnih pokušaja po kodu prije nego što se poništi.</summary>
-        private const int MaxAttempts = 5;
+        protected override string Table => "password_reset_tokens";
+        protected override TimeSpan Lifetime => TimeSpan.FromHours(1);
 
-        /// <summary>Najmanji razmak između dva slanja koda istom korisniku.</summary>
-        private static readonly TimeSpan ResendCooldown = TimeSpan.FromSeconds(60);
+        // Novi kod poništava već izdanu dozvolu — inače bi stara i dalje vrijedila
+        // iako je korisnik u međuvremenu zatražio reset ispočetka.
+        protected override string ExtraUpsertSet => ", ticket = NULL, ticket_expires_at = NULL";
 
-        public PasswordResetRepository(DatabaseConnection db, IConfiguration config)
-        {
-            _db = db;
-            // Kod u bazi nije u čistom obliku: HMAC s tajnom poslužitelja. Tko
-            // dobije kopiju baze ne može iz nje pročitati žive kodove, a samih
-            // 900.000 mogućih kodova ne može unaprijed izračunati bez ključa.
-            _hmacKey = Encoding.UTF8.GetBytes(config["Jwt:Key"]
-                ?? throw new InvalidOperationException("Jwt:Key nije postavljen."));
-        }
-
-        private string HashCode(int userId, string code)
-        {
-            using var hmac = new HMACSHA256(_hmacKey);
-            // userId ulazi u hash pa isti kod kod dva korisnika daje različit zapis.
-            var bytes = hmac.ComputeHash(Encoding.UTF8.GetBytes($"{userId}:{code}"));
-            return Convert.ToHexString(bytes);
-        }
+        public PasswordResetRepository(DatabaseConnection db, IConfiguration config) : base(db, config) { }
 
         /// <summary>
-        /// Sprema novi kod (zamjenjuje stari). Vraća false ako je kod za ovog
-        /// korisnika već poslan unutar <see cref="ResendCooldown"/> — tada se
-        /// ništa ne mijenja i e-mail se ne šalje (zaštita od zatrpavanja
-        /// tuđeg sandučića zahtjevima za reset).
+        /// Nakon što je 6-znamenkasti kod ispravno unesen: poništava ga (više se ne
+        /// može iskoristiti) i izdaje dozvolu za promjenu lozinke. Dozvola je
+        /// nasumičan 256-bitni niz — za razliku od koda ne da se pogoditi, pa
+        /// završni korak više ne ovisi o šest znamenki.
         /// </summary>
-        public async Task<bool> CreateResetTokenAsync(int userId, string code)
+        public async Task<string> IssueTicketAsync(int userId)
         {
-            using var conn = _db.CreateConnection();
-            var now = DateTime.UtcNow;
+            var ticket = Convert.ToBase64String(RandomNumberGenerator.GetBytes(32))
+                .Replace('+', '-').Replace('/', '_').TrimEnd('=');
 
-            var lastCreated = await conn.QueryFirstOrDefaultAsync<DateTime?>(
-                "SELECT created_at FROM password_reset_tokens WHERE user_id = @UserId",
-                new { UserId = userId });
-            if (lastCreated.HasValue && now - lastCreated.Value < ResendCooldown)
-                return false;
-
-            // Upsert (jedinstveni indeks na user_id): dva istovremena zahtjeva za
-            // istog korisnika ne smiju završiti greškom prije slanja e-maila.
+            using var conn = Db.CreateConnection();
+            // token = '' : prazan niz nikad ne odgovara hashu, pa se stari kod
+            // ne može ponovno upotrijebiti.
             await conn.ExecuteAsync(@"
-                INSERT INTO password_reset_tokens (user_id, token, expires_at, created_at, attempts)
-                VALUES (@UserId, @Token, @ExpiresAt, @CreatedAt, 0)
-                ON CONFLICT (user_id) DO UPDATE
-                SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at,
-                    created_at = EXCLUDED.created_at, attempts = 0",
+                UPDATE password_reset_tokens
+                SET token = '', ticket = @Ticket, ticket_expires_at = @Expires
+                WHERE user_id = @UserId",
                 new
                 {
                     UserId = userId,
-                    Token = HashCode(userId, code),
-                    ExpiresAt = now.AddHours(1),
-                    CreatedAt = now
+                    Ticket = Hash(userId, "ticket:" + ticket),
+                    Expires = DateTime.UtcNow.Add(TicketLifetime)
                 });
-            return true;
+            return ticket;
         }
 
-        /// <summary>
-        /// Provjerava kod uz e-mail: kod mora pripadati baš tom korisniku.
-        ///
-        /// Pokušaj se broji PRIJE usporedbe, u istoj atomarnoj naredbi koja
-        /// dohvaća zapis — pa paralelni zahtjevi ne mogu premašiti
-        /// <see cref="MaxAttempts"/> pogađanja. Istekao ili iscrpljen kod se
-        /// ne vraća uopće.
-        /// </summary>
-        public async Task<(int UserId, bool IsValid)> ValidateTokenAsync(string code, string email)
+        /// <summary>Vrijedi li dozvola za korisnika s ovim e-mailom. Ne troši je.</summary>
+        public async Task<(int UserId, bool IsValid)> RedeemTicketAsync(string ticket, string email)
         {
-            using var conn = _db.CreateConnection();
-
-            var row = await conn.QueryFirstOrDefaultAsync<ResetRow>(@"
-                UPDATE password_reset_tokens t
-                SET attempts = t.attempts + 1
-                FROM users u
-                WHERE u.id = t.user_id
-                  AND LOWER(u.email) = LOWER(@Email)
-                  AND t.attempts < @MaxAttempts
-                  AND t.expires_at > @Now
-                RETURNING t.user_id AS UserId, t.token AS Token",
-                new { Email = email, MaxAttempts, Now = DateTime.UtcNow });
+            using var conn = Db.CreateConnection();
+            var row = await conn.QueryFirstOrDefaultAsync<TicketRow>(@"
+                SELECT t.user_id AS UserId, t.ticket AS Ticket
+                FROM password_reset_tokens t
+                JOIN users u ON u.id = t.user_id
+                WHERE LOWER(u.email) = LOWER(@Email)
+                  AND t.ticket IS NOT NULL
+                  AND t.ticket_expires_at > @Now",
+                new { Email = email, Now = DateTime.UtcNow });
 
             if (row == null)
                 return (0, false);
 
-            var expected = HashCode(row.UserId, code);
-            var matches = CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(row.Token), Encoding.UTF8.GetBytes(expected));
-
-            return matches ? (row.UserId, true) : (0, false);
+            return ConstantTimeEquals(row.Ticket, Hash(row.UserId, "ticket:" + ticket))
+                ? (row.UserId, true)
+                : (0, false);
         }
 
-        private class ResetRow
+        public class TicketRow
         {
             public int UserId { get; set; }
-            public string Token { get; set; } = "";
-        }
-
-        /// <summary>Briše kod korisnika (nakon uspješne promjene lozinke ili neuspjelog slanja).</summary>
-        public async Task DeleteTokensForUserAsync(int userId)
-        {
-            using var conn = _db.CreateConnection();
-            await conn.ExecuteAsync(
-                "DELETE FROM password_reset_tokens WHERE user_id = @UserId",
-                new { UserId = userId });
+            public string Ticket { get; set; } = "";
         }
     }
 }

@@ -78,6 +78,31 @@ builder.Services.AddAuthentication(JwtBearerDefaults.AuthenticationScheme)
             ValidateLifetime = true,
             ClockSkew = TimeSpan.Zero
         };
+
+        // Potpis i rok ne bi odbili token izdan prije reseta lozinke. Zato se uz
+        // svaki zahtjev provjerava da verzija sesije u tokenu ("tv") još odgovara
+        // onoj u bazi — reset lozinke je povećava i time odjavljuje sve uređaje.
+        // Token bez "tv" (izdan prije ove izmjene) vrijedi kao verzija 0.
+        options.Events = new JwtBearerEvents
+        {
+            OnTokenValidated = async ctx =>
+            {
+                var idClaim = ctx.Principal?.FindFirst(System.Security.Claims.ClaimTypes.NameIdentifier)?.Value;
+                if (!int.TryParse(idClaim, out var userId))
+                {
+                    ctx.Fail("Neispravan token");
+                    return;
+                }
+
+                var tokenVersion = int.TryParse(ctx.Principal!.FindFirst("tv")?.Value, out var tv) ? tv : 0;
+                var current = await ctx.HttpContext.RequestServices
+                    .GetRequiredService<TokenVersionService>().GetAsync(userId);
+
+                // current == null: račun je obrisan.
+                if (current == null || current.Value != tokenVersion)
+                    ctx.Fail("Sesija je poništena");
+            }
+        };
     });
 
 // Services
@@ -101,6 +126,9 @@ builder.Services.AddScoped<AdminRepository>();
 builder.Services.AddScoped<IEmailService, EmailService>();
 builder.Services.AddScoped<IEmailServiceWithInlineImages, EmailService>();
 builder.Services.AddScoped<PasswordResetRepository>();
+builder.Services.AddScoped<EmailVerificationRepository>();
+builder.Services.AddMemoryCache();
+builder.Services.AddSingleton<TokenVersionService>();
 
 builder.Services.AddControllers();
 builder.Services.AddEndpointsApiExplorer();

@@ -45,8 +45,8 @@ namespace CroMap.Repositories
                 var passwordHash = BCrypt.Net.BCrypt.HashPassword(seedPassword);
 
                 var insertQuery = @"
-            INSERT INTO users (email, username, first_name, last_name, password_hash, birth_date, is_admin, created_at)
-            VALUES (@Email, @Username, @FirstName, @LastName, @PasswordHash, @BirthDate, true, NOW())";
+            INSERT INTO users (email, username, first_name, last_name, password_hash, birth_date, is_admin, email_verified, created_at)
+            VALUES (@Email, @Username, @FirstName, @LastName, @PasswordHash, @BirthDate, true, true, NOW())";
 
                 await connection.ExecuteAsync(insertQuery, new
                 {

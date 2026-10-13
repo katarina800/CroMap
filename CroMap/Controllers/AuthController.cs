@@ -24,6 +24,8 @@ namespace CroMap.Controllers
         private readonly DatabaseConnection _dbConnection;
         private readonly IEmailService _emailService;
         private readonly PasswordResetRepository _resetRepo;
+        private readonly EmailVerificationRepository _verifyRepo;
+        private readonly TokenVersionService _tokenVersions;
 
         // ─── VARA logo: CID inline embedding ─────────────────────────────────
         private const string _logo80Cid = "vara_logo_80";
@@ -58,7 +60,8 @@ namespace CroMap.Controllers
         };
 
         public AuthController(UserRepository repo, IConfiguration configuration, ILogger<AuthController> logger,
-            DatabaseConnection dbConnection, IEmailService emailService, PasswordResetRepository resetRepo)
+            DatabaseConnection dbConnection, IEmailService emailService, PasswordResetRepository resetRepo,
+            EmailVerificationRepository verifyRepo, TokenVersionService tokenVersions)
         {
             _repo = repo;
             _configuration = configuration;
@@ -66,6 +69,8 @@ namespace CroMap.Controllers
             _dbConnection = dbConnection;
             _emailService = emailService;
             _resetRepo = resetRepo;
+            _verifyRepo = verifyRepo;
+            _tokenVersions = tokenVersions;
         }
 
         // ─── Helper za slanje emaila s inline slikama ─────────────────────────
@@ -110,11 +115,28 @@ namespace CroMap.Controllers
             if (!userDto.BirthDate.HasValue)
                 return BadRequest(new { field = "birthDate", code = "required" });
 
+            var email = userDto.Email.Trim();
+
+            // Adresa koju još nitko nije potvrdio nije ničija: da je netko upisao
+            // tuđi e-mail, pravi vlasnik ne bi mogao otvoriti račun ("email već
+            // postoji"). Takav neprovjereni račun (bez prijave, pa bez sadržaja)
+            // se uklanja i registracija ide dalje — nastavit će je samo onaj tko
+            // doista dobije kod na tu adresu.
+            // Isto i za korisničko ime, ali tek nakon 10 minuta: tko je pogriješio u
+            // e-mail adresi (račun mu je ostao neprovjeren) može se ponovno registrirati
+            // istim imenom, a tuđa registracija u tijeku se ne može odmah srušiti.
+            try
+            {
+                await _repo.DeleteUnverifiedByEmailAsync(email);
+                await _repo.DeleteStaleUnverifiedByUsernameAsync(userDto.Username.Trim());
+            }
+            catch (Exception ex) { _logger.LogWarning(ex, "Brisanje neprovjerenog računa nije uspjelo"); }
+
             // 🔥 Provjera jedinstvenosti PRIJE inserta — precizna po polju
             if (await _repo.UsernameExistsAsync(userDto.Username))
                 return Conflict(new { field = "username", code = "taken" });
 
-            if (await _repo.EmailExistsAsync(userDto.Email))
+            if (await _repo.EmailExistsAsync(email))
                 return Conflict(new { field = "email", code = "taken" });
 
             var lang = NormalizeLang(userDto.Language);
@@ -126,7 +148,7 @@ namespace CroMap.Controllers
                 Username = userDto.Username.Trim().ToLower(),
                 FirstName = userDto.FirstName.Trim(),
                 LastName = userDto.LastName.Trim(),
-                Email = userDto.Email.Trim(),
+                Email = email,
                 PasswordHash = userDto.Password,
                 BirthDate = userDto.BirthDate.Value,
                 Language = lang,
@@ -135,27 +157,13 @@ namespace CroMap.Controllers
 
             try
             {
-                await _repo.RegisterAsync(user);
-                if (!string.IsNullOrWhiteSpace(userDto.Email))
-                {
-                    _ = Task.Run(async () =>
-                    {
-                        try
-                        {
-                            await SendEmailWithInlineImages(
-                    userDto.Email,
-                    T(lang, "welcomeSubject"),
-                    BuildWelcomeEmail(userDto.FirstName, lang),
-                    GetLogoAttachments()
-                            );
-                        }
-                        catch (Exception ex)
-                        {
-                            _logger.LogWarning(ex, "Welcome email failed, ignoring");
-                        }
-                    });
-                }
-                return Ok(new { message = "Registracija uspješna" });
+                var newUserId = await _repo.RegisterAsync(user);
+
+                // Račun je neprovjeren dok korisnik ne unese kod poslan na ovu adresu.
+                // Ako slanje ne uspije, ekran za potvrdu nudi "pošalji ponovno".
+                await SendVerificationCodeAsync(newUserId, email, user.FirstName, lang);
+
+                return Ok(new { message = "Registracija uspješna", needsVerification = true, email });
             }
             catch (Exception ex)
             {
@@ -164,6 +172,109 @@ namespace CroMap.Controllers
                 if (ex.Message.Contains("23505") || ex.Message.Contains("duplicate key"))
                     return Conflict(new { field = "unknown", code = "taken" });
                 return BadRequest(new { field = "unknown", code = "serverError" });
+            }
+        }
+
+        private async Task<bool> SendVerificationCodeAsync(int userId, string email, string firstName, string lang)
+        {
+            var code = System.Security.Cryptography.RandomNumberGenerator
+                .GetInt32(100000, 1000000).ToString();
+
+            // Ne baca iznimku: račun u trenutku poziva već postoji, pa kvar pri slanju
+            // ne smije registraciju prikazati kao neuspjelu (ponovni pokušaj bi onda
+            // javio "korisničko ime zauzeto"). Korisnik kod može zatražiti ponovno.
+            try
+            {
+                // false = kod za ovog korisnika je već poslan prije manje od minute.
+                if (!await _verifyRepo.CreateAsync(userId, code))
+                    return false;
+
+                await SendEmailWithInlineImages(
+                    email,
+                    T(lang, "verifySubject"),
+                    BuildResetEmail(firstName, code, lang, "verify"),
+                    GetLogoAttachments());
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "Verifikacijski e-mail NIJE poslan korisniku {UserId}", userId);
+                try { await _verifyRepo.DeleteForUserAsync(userId); } catch { /* već zabilježeno */ }
+                return false;
+            }
+        }
+
+        [HttpPost("verify-email")]
+        [EnableRateLimiting("auth")]
+        public async Task<IActionResult> VerifyEmail([FromBody] VerifyEmailDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Email) || string.IsNullOrWhiteSpace(dto.Code))
+                return BadRequest(new { message = "Email i kod su obavezni" });
+            try
+            {
+                var (userId, isValid) = await _verifyRepo.ValidateAsync(dto.Code.Trim(), dto.Email.Trim());
+                if (!isValid)
+                    return BadRequest(new { message = "Kod je neispravan ili je istekao" });
+
+                using var conn = _dbConnection.CreateConnection();
+                await conn.ExecuteAsync(
+                    "UPDATE users SET email_verified = TRUE WHERE id = @Id", new { Id = userId });
+                await _verifyRepo.DeleteForUserAsync(userId);
+
+                var user = await conn.QueryFirstOrDefaultAsync<User>(
+                    "SELECT first_name AS FirstName, email, language AS Language FROM users WHERE id = @Id",
+                    new { Id = userId });
+                if (user != null)
+                {
+                    var lang = NormalizeLang(user.Language);
+                    _ = Task.Run(async () =>
+                    {
+                        try
+                        {
+                            await SendEmailWithInlineImages(
+                                user.Email,
+                                T(lang, "welcomeSubject"),
+                                BuildWelcomeEmail(user.FirstName, lang),
+                                GetLogoAttachments());
+                        }
+                        catch (Exception ex)
+                        {
+                            _logger.LogWarning(ex, "Welcome email failed, ignoring");
+                        }
+                    });
+                }
+                return Ok(new { message = "E-mail potvrđen" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "VerifyEmail error");
+                return StatusCode(500, new { message = "Greška pri potvrdi e-maila" });
+            }
+        }
+
+        [HttpPost("resend-verification")]
+        [EnableRateLimiting("auth")]
+        public async Task<IActionResult> ResendVerification([FromBody] ForgotPasswordDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Email))
+                return BadRequest(new { message = "Email je obavezan" });
+            try
+            {
+                using var conn = _dbConnection.CreateConnection();
+                var user = await conn.QueryFirstOrDefaultAsync<User>(
+                    "SELECT id, first_name AS FirstName, email, language AS Language FROM users " +
+                    "WHERE LOWER(email) = LOWER(@Email) AND email_verified = FALSE",
+                    new { Email = dto.Email.Trim() });
+
+                // Isti odgovor postoji li račun ili ne (kao kod forgot-password).
+                if (user != null)
+                    await SendVerificationCodeAsync(user.Id, user.Email, user.FirstName, NormalizeLang(user.Language));
+                return Ok(new { message = "Ako račun čeka potvrdu, kod je poslan" });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "ResendVerification error");
+                return StatusCode(500, new { message = "Greška pri slanju koda" });
             }
         }
 
@@ -199,7 +310,7 @@ namespace CroMap.Controllers
 
                     // Kod ide ISKLJUČIVO na adresu spremljenu uz račun (user.Email),
                     // nikad na ono što je klijent poslao.
-                    if (await _resetRepo.CreateResetTokenAsync(user.Id, code))
+                    if (await _resetRepo.CreateAsync(user.Id, code))
                     {
                         try
                         {
@@ -217,7 +328,7 @@ namespace CroMap.Controllers
                             // Odgovor ostaje isti da se ne otkrije postoji li račun;
                             // uzrok je u logu (EmailService bilježi SendGrid odgovor).
                             _logger.LogError(mailEx, "Reset e-mail NIJE poslan korisniku {UserId}", user.Id);
-                            await _resetRepo.DeleteTokensForUserAsync(user.Id);
+                            await _resetRepo.DeleteForUserAsync(user.Id);
                         }
                     }
                 }
@@ -230,30 +341,73 @@ namespace CroMap.Controllers
             }
         }
 
+        /// <summary>
+        /// Korak 2 resetiranja: poslužitelj provjerava 6-znamenkasti kod (uz e-mail)
+        /// PRIJE nego aplikacija prikaže ekran za novu lozinku. Uspjeh poništava kod
+        /// i vraća jednokratnu dozvolu (resetToken) kojom se u koraku 3 mijenja lozinka.
+        /// </summary>
+        [HttpPost("verify-reset-code")]
+        [EnableRateLimiting("auth")]
+        public async Task<IActionResult> VerifyResetCode([FromBody] VerifyResetCodeDto dto)
+        {
+            if (string.IsNullOrWhiteSpace(dto.Email) || string.IsNullOrWhiteSpace(dto.Code))
+                return BadRequest(new { message = "Email i kod su obavezni" });
+            try
+            {
+                var (userId, isValid) = await _resetRepo.ValidateAsync(dto.Code.Trim(), dto.Email.Trim());
+                if (!isValid)
+                    return BadRequest(new { message = "Kod je neispravan ili je istekao" });
+
+                var resetToken = await _resetRepo.IssueTicketAsync(userId);
+                return Ok(new { resetToken });
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "VerifyResetCode error");
+                return StatusCode(500, new { message = "Greška pri provjeri koda" });
+            }
+        }
+
         [HttpPost("reset-password")]
         [EnableRateLimiting("auth")]
         public async Task<IActionResult> ResetPassword([FromBody] ResetPasswordDto dto)
         {
-            if (string.IsNullOrWhiteSpace(dto.Code) || string.IsNullOrWhiteSpace(dto.NewPassword))
-                return BadRequest(new { message = "Kod i nova lozinka su obavezni" });
+            if (string.IsNullOrWhiteSpace(dto.NewPassword))
+                return BadRequest(new { message = "Nova lozinka je obavezna" });
+            if (string.IsNullOrWhiteSpace(dto.Code) && string.IsNullOrWhiteSpace(dto.ResetToken))
+                return BadRequest(new { message = "Kod je obavezan" });
             if (string.IsNullOrWhiteSpace(dto.Email))
                 return BadRequest(new { message = "Email je obavezan" });
             if (dto.NewPassword.Length < 6)
                 return BadRequest(new { message = "Lozinka mora imati najmanje 6 znakova" });
             try
             {
-                // Kod se provjerava uz e-mail: dosad je vrijedio bilo koji živi
-                // kod, bez obzira kojem korisniku pripada.
-                var (userId, isValid) = await _resetRepo.ValidateTokenAsync(dto.Code.Trim(), dto.Email.Trim());
+                var email = dto.Email.Trim();
+
+                // Novi tijek: dozvola izdana nakon provjere koda (verify-reset-code).
+                // Stariji klijenti šalju sam kod u ovom koraku — i to ostaje podržano.
+                var (userId, isValid) = !string.IsNullOrWhiteSpace(dto.ResetToken)
+                    ? await _resetRepo.RedeemTicketAsync(dto.ResetToken.Trim(), email)
+                    : await _resetRepo.ValidateAsync(dto.Code!.Trim(), email);
                 if (!isValid)
                     return BadRequest(new { message = "Kod je neispravan ili je istekao" });
+
                 var hashedPassword = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword);
                 using var conn = _dbConnection.CreateConnection();
-                await conn.ExecuteAsync(
-                    "UPDATE users SET password_hash = @Hash WHERE id = @Id",
+
+                // token_version + 1 poništava SVE ranije izdane tokene (odjava sa
+                // svih uređaja): tko je imao pristup računu sa starom lozinkom,
+                // nakon reseta ga više nema. E-mail je ovime i potvrđen — kod je
+                // stigao samo vlasniku sandučića.
+                await conn.ExecuteAsync(@"
+                    UPDATE users
+                    SET password_hash = @Hash, token_version = token_version + 1, email_verified = TRUE
+                    WHERE id = @Id",
                     new { Hash = hashedPassword, Id = userId });
-                // Briše se kod ovog korisnika (ne "svaki kod s istom vrijednošću").
-                await _resetRepo.DeleteTokensForUserAsync(userId);
+                _tokenVersions.Invalidate(userId);
+
+                await _resetRepo.DeleteForUserAsync(userId);
+                await _verifyRepo.DeleteForUserAsync(userId);
                 return Ok(new { message = "Lozinka uspje\u0161no promijenjena" });
             }
             catch (Exception ex)
@@ -292,6 +446,12 @@ namespace CroMap.Controllers
                 ["resetBody"] = "Primili smo zahtjev za promjenu lozinke vašeg VARA računa. Upotrijebite kod ispod u aplikaciji:",
                 ["resetValid"] = "⏳️ Kod je valjan 1 sat od slanja ovog emaila.",
                 ["resetIgnore"] = "🔒 Ako niste zatražili promjenu lozinke, zanemarite ovaj email — vaš račun je siguran.",
+                ["verifySubject"] = "VARA - Potvrdite e-mail adresu ✉️",
+                ["verifyTagline"] = "Potvrda e-maila",
+                ["verifyGreeting"] = "Potvrdite e-mail, {0}",
+                ["verifyBody"] = "Hvala na registraciji u VARA aplikaciji. Unesite kod ispod u aplikaciju kako biste potvrdili da ova e-mail adresa pripada vama:",
+                ["verifyValid"] = "⏳️ Kod je valjan 24 sata od slanja ovog emaila.",
+                ["verifyIgnore"] = "🔒 Ako se niste registrirali u VARA aplikaciji, zanemarite ovaj email.",
             },
             ["en"] = new()
             {
@@ -310,6 +470,12 @@ namespace CroMap.Controllers
                 ["resetBody"] = "We received a request to change the password for your VARA account. Use the code below in the app:",
                 ["resetValid"] = "⏳️ The code is valid for 1 hour from when this email was sent.",
                 ["resetIgnore"] = "🔒 If you did not request a password change, ignore this email — your account is safe.",
+                ["verifySubject"] = "VARA - Confirm your email address ✉️",
+                ["verifyTagline"] = "Email confirmation",
+                ["verifyGreeting"] = "Confirm your email, {0}",
+                ["verifyBody"] = "Thanks for signing up for VARA. Enter the code below in the app to confirm that this email address belongs to you:",
+                ["verifyValid"] = "⏳️ The code is valid for 24 hours from when this email was sent.",
+                ["verifyIgnore"] = "🔒 If you did not sign up for VARA, ignore this email.",
             },
             ["it"] = new()
             {
@@ -328,6 +494,12 @@ namespace CroMap.Controllers
                 ["resetBody"] = "Abbiamo ricevuto una richiesta di modifica della password del tuo account VARA. Usa il codice qui sotto nell'app:",
                 ["resetValid"] = "⏳️ Il codice è valido per 1 ora dall'invio di questa email.",
                 ["resetIgnore"] = "🔒 Se non hai richiesto una modifica della password, ignora questa email — il tuo account è al sicuro.",
+                ["verifySubject"] = "VARA - Conferma il tuo indirizzo e-mail ✉️",
+                ["verifyTagline"] = "Conferma e-mail",
+                ["verifyGreeting"] = "Conferma la tua e-mail, {0}",
+                ["verifyBody"] = "Grazie per esserti registrato/a su VARA. Inserisci il codice qui sotto nell'app per confermare che questo indirizzo e-mail ti appartiene:",
+                ["verifyValid"] = "⏳️ Il codice è valido per 24 ore dall'invio di questa email.",
+                ["verifyIgnore"] = "🔒 Se non ti sei registrato/a su VARA, ignora questa email.",
             },
             ["de"] = new()
             {
@@ -346,6 +518,12 @@ namespace CroMap.Controllers
                 ["resetBody"] = "Wir haben eine Anfrage zur Änderung des Passworts Ihres VARA-Kontos erhalten. Verwenden Sie den folgenden Code in der App:",
                 ["resetValid"] = "⏳️ Der Code ist 1 Stunde ab dem Versand dieser E-Mail gültig.",
                 ["resetIgnore"] = "🔒 Falls Sie keine Passwortänderung angefordert haben, ignorieren Sie diese E-Mail — Ihr Konto ist sicher.",
+                ["verifySubject"] = "VARA - Bestätigen Sie Ihre E-Mail-Adresse ✉️",
+                ["verifyTagline"] = "E-Mail-Bestätigung",
+                ["verifyGreeting"] = "Bestätigen Sie Ihre E-Mail, {0}",
+                ["verifyBody"] = "Danke für Ihre Registrierung bei VARA. Geben Sie den folgenden Code in der App ein, um zu bestätigen, dass diese E-Mail-Adresse Ihnen gehört:",
+                ["verifyValid"] = "⏳️ Der Code ist 24 Stunden ab dem Versand dieser E-Mail gültig.",
+                ["verifyIgnore"] = "🔒 Falls Sie sich nicht bei VARA registriert haben, ignorieren Sie diese E-Mail.",
             },
             ["fr"] = new()
             {
@@ -364,6 +542,12 @@ namespace CroMap.Controllers
                 ["resetBody"] = "Nous avons reçu une demande de modification du mot de passe de votre compte VARA. Utilisez le code ci-dessous dans l'application :",
                 ["resetValid"] = "⏳️ Le code est valable 1 heure à compter de l'envoi de cet e-mail.",
                 ["resetIgnore"] = "🔒 Si vous n'avez pas demandé de modification de mot de passe, ignorez cet e-mail — votre compte est en sécurité.",
+                ["verifySubject"] = "VARA - Confirmez votre adresse e-mail ✉️",
+                ["verifyTagline"] = "Confirmation de l'e-mail",
+                ["verifyGreeting"] = "Confirmez votre e-mail, {0}",
+                ["verifyBody"] = "Merci de vous être inscrit(e) sur VARA. Saisissez le code ci-dessous dans l'application pour confirmer que cette adresse e-mail vous appartient :",
+                ["verifyValid"] = "⏳️ Le code est valable 24 heures à compter de l'envoi de cet e-mail.",
+                ["verifyIgnore"] = "🔒 Si vous ne vous êtes pas inscrit(e) sur VARA, ignorez cet e-mail.",
             },
         };
 
@@ -406,7 +590,7 @@ namespace CroMap.Controllers
 </html>";
         }
 
-        private string BuildResetEmail(string firstName, string code, string language)
+        private string BuildResetEmail(string firstName, string code, string language, string keyPrefix = "reset")
         {
             var lang = NormalizeLang(language);
             return $@"
@@ -429,12 +613,12 @@ namespace CroMap.Controllers
       <table cellpadding='0' cellspacing='0' border='0' width='100%'>
         <tr><td align='center' style='padding-bottom:12px'>{LogoImg(_logo80Cid, 80)}</td></tr>
         <tr><td align='center'><div style='color:#ffffff;font-size:34px;font-weight:900;letter-spacing:12px;padding-left:12px'>VARA</div></td></tr>
-        <tr><td align='center'><div style='color:rgba(200,225,200,0.6);font-size:12px;letter-spacing:3px;text-transform:uppercase;padding-top:4px'>{T(lang, "resetTagline")}</div></td></tr>
+        <tr><td align='center'><div style='color:rgba(200,225,200,0.6);font-size:12px;letter-spacing:3px;text-transform:uppercase;padding-top:4px'>{T(lang, keyPrefix + "Tagline")}</div></td></tr>
       </table>
     </div>
     <div class='vara-content' style='padding:32px'>
-      <h2 style='color:#1a1a1a;font-size:20px;margin:0 0 8px;font-weight:800'>{string.Format(T(lang, "resetGreeting"), firstName)}</h2>
-      <p style='color:#555;line-height:1.7;font-size:15px;margin:0 0 28px'>{T(lang, "resetBody")}</p>
+      <h2 style='color:#1a1a1a;font-size:20px;margin:0 0 8px;font-weight:800'>{string.Format(T(lang, keyPrefix + "Greeting"), firstName)}</h2>
+      <p style='color:#555;line-height:1.7;font-size:15px;margin:0 0 28px'>{T(lang, keyPrefix + "Body")}</p>
       <table cellpadding='0' cellspacing='0' border='0' width='100%' style='margin-bottom:28px'>
         <tr><td align='center' valign='middle'>
           <table cellpadding='0' cellspacing='0' border='0' style='margin:0 auto;max-width:100%'>
@@ -450,8 +634,8 @@ namespace CroMap.Controllers
       </table>
       <div style='background:#fff8e1;border:1px solid #ffe082;border-radius:12px;padding:16px'>
         <p style='color:#795548;font-size:13px;margin:0;line-height:1.6'>
-          {T(lang, "resetValid")}<br>
-          {T(lang, "resetIgnore")}
+          {T(lang, keyPrefix + "Valid")}<br>
+          {T(lang, keyPrefix + "Ignore")}
         </p>
       </div>
     </div>
@@ -481,8 +665,17 @@ namespace CroMap.Controllers
                     _logger.LogWarning($"Login failed for: {dto.Username}");
                     return Unauthorized(new { message = "Neispravno korisni\u010dko ime ili lozinka" });
                 }
+                // Lozinka je točna, ali e-mail nije potvrđen: bez ulaska, aplikacija
+                // vodi na ekran za unos koda.
+                if (!user.EmailVerified)
+                    return StatusCode(403, new
+                    {
+                        code = "emailNotVerified",
+                        email = user.Email,
+                        message = "E-mail adresa nije potvrđena"
+                    });
                 _logger.LogInformation($"Login successful: {user.Username} (ID: {user.Id})");
-                var token = GenerateJwtToken(user);
+                var token = await GenerateJwtTokenAsync(user);
                 return Ok(new
                 {
                     token = token,
@@ -633,7 +826,7 @@ namespace CroMap.Controllers
                 id, username, first_name AS FirstName, last_name AS LastName,
                 email, phone, password_hash AS PasswordHash, birth_date AS BirthDate,
                 created_at AS CreatedAt, is_admin AS IsAdmin, google_id AS GoogleId,
-                auth_provider AS AuthProvider
+                auth_provider AS AuthProvider, email_verified AS EmailVerified
             FROM users
             WHERE google_id = @GoogleId OR LOWER(email) = LOWER(@Email)",
                     new { GoogleId = payload.Subject, Email = payload.Email });
@@ -654,6 +847,20 @@ namespace CroMap.Controllers
                             "UPDATE users SET google_id = @GoogleId, auth_provider = 'google' WHERE id = @Id",
                             new { GoogleId = payload.Subject, user.Id });
                     }
+
+                    // Google je dokazao da je ovaj e-mail kod prijavljenog korisnika. Ako je
+                    // račun s tom adresom bio neprovjeren, lozinku je mogao postaviti netko
+                    // tko je tuđu adresu samo upisao pri registraciji — pa se briše (korisnik
+                    // postavlja novu), a sve ranije sesije se poništavaju.
+                    if (payload.EmailVerified && !user.EmailVerified)
+                    {
+                        await connection.ExecuteAsync(@"
+                            UPDATE users
+                            SET email_verified = TRUE, password_hash = NULL, token_version = token_version + 1
+                            WHERE id = @Id", new { user.Id });
+                        _tokenVersions.Invalidate(user.Id);
+                        needsPassword = true;
+                    }
                 }
                 else
                 {
@@ -667,8 +874,8 @@ namespace CroMap.Controllers
                     }
 
                     var newUserId = await connection.ExecuteScalarAsync<int>(@"
-    INSERT INTO users (first_name, last_name, email, username, password_hash, google_id, auth_provider, birth_date, language, created_at)
-    VALUES (@FirstName, @LastName, @Email, @Username, NULL, @GoogleId, 'google', NULL, @Language, @CreatedAt)
+    INSERT INTO users (first_name, last_name, email, username, password_hash, google_id, auth_provider, birth_date, language, email_verified, created_at)
+    VALUES (@FirstName, @LastName, @Email, @Username, NULL, @GoogleId, 'google', NULL, @Language, @EmailVerified, @CreatedAt)
     RETURNING id",
     new
     {
@@ -678,6 +885,7 @@ namespace CroMap.Controllers
         Username = username,
         GoogleId = payload.Subject,
         Language = NormalizeLang(Request.Headers["Accept-Language"].FirstOrDefault()),
+        EmailVerified = payload.EmailVerified,
         CreatedAt = DateTime.UtcNow
     });
 
@@ -692,7 +900,7 @@ namespace CroMap.Controllers
                     needsPassword = true; // 🔥 novi Google korisnik nema lozinku
                 }
 
-                var token = GenerateJwtToken(user);
+                var token = await GenerateJwtTokenAsync(user);
                 return Ok(new
                 {
                     token,
@@ -800,8 +1008,14 @@ namespace CroMap.Controllers
             return true;
         }
 
-        private string GenerateJwtToken(User user)
+        private async Task<string> GenerateJwtTokenAsync(User user)
         {
+            // Verzija sesije ide u token: reset lozinke je povećava i time poništava
+            // sve ranije izdane tokene (provjera u Program.cs, OnTokenValidated).
+            using var vconn = _dbConnection.CreateConnection();
+            var tokenVersion = await vconn.ExecuteScalarAsync<int>(
+                "SELECT token_version FROM users WHERE id = @Id", new { user.Id });
+
             var tokenHandler = new JwtSecurityTokenHandler();
             // UTF8, jednako kao pri provjeri tokena u Program.cs. ASCII bi svaki
             // znak izvan ASCII-ja u ključu pretvorio u "?", pa bi potpisivanje i
@@ -812,7 +1026,8 @@ namespace CroMap.Controllers
                 new Claim(ClaimTypes.NameIdentifier, user.Id.ToString()),
                 new Claim(ClaimTypes.Name, $"{user.FirstName} {user.LastName}"),
                 new Claim("firstName", user.FirstName ?? ""),
-                new Claim("lastName", user.LastName ?? "")
+                new Claim("lastName", user.LastName ?? ""),
+                new Claim("tv", tokenVersion.ToString())
             };
             if (!string.IsNullOrEmpty(user.Email))
                 claims.Add(new Claim(ClaimTypes.Email, user.Email));
@@ -839,6 +1054,16 @@ namespace CroMap.Controllers
             var token = tokenHandler.CreateToken(tokenDescriptor);
             return tokenHandler.WriteToken(token);
         }
+
+        /// <summary>
+        /// Je li prijava još valjana. Sam [Authorize] (uključujući provjeru verzije
+        /// sesije u Program.cs) odlučuje: poništen token dobije 401. Aplikacija ga
+        /// zove pri povratku u prvi plan da se korisnik odjavljen resetom lozinke
+        /// na drugom uređaju odmah vrati na prijavu, umjesto na prazne ekrane.
+        /// </summary>
+        [HttpGet("session")]
+        [Authorize]
+        public IActionResult Session() => NoContent();
 
         [HttpPut("language")]
         [Authorize]

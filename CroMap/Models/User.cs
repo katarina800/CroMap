@@ -16,5 +16,8 @@
 
         public string Language { get; set; } = "hr";
         public string AuthProvider { get; set; } = "local";
+
+        /// <summary>Je li korisnik potvrdio da mu e-mail adresa pripada (kod poslan e-mailom).</summary>
+        public bool EmailVerified { get; set; }
     }
 }
