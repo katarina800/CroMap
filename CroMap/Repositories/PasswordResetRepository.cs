@@ -1,4 +1,4 @@
-﻿// Repositories/PasswordResetRepository.cs
+// Repositories/PasswordResetRepository.cs
 using System.Security.Cryptography;
 using System.Text;
 using CroMap.Data;
@@ -9,105 +9,113 @@ namespace CroMap.Repositories
     public class PasswordResetRepository
     {
         private readonly DatabaseConnection _db;
+        private readonly byte[] _hmacKey;
 
-        public PasswordResetRepository(DatabaseConnection db)
+        /// <summary>Najviše ovoliko pogrešnih pokušaja po kodu prije nego što se poništi.</summary>
+        private const int MaxAttempts = 5;
+
+        /// <summary>Najmanji razmak između dva slanja koda istom korisniku.</summary>
+        private static readonly TimeSpan ResendCooldown = TimeSpan.FromSeconds(60);
+
+        public PasswordResetRepository(DatabaseConnection db, IConfiguration config)
         {
             _db = db;
+            // Kod u bazi nije u čistom obliku: HMAC s tajnom poslužitelja. Tko
+            // dobije kopiju baze ne može iz nje pročitati žive kodove, a samih
+            // 900.000 mogućih kodova ne može unaprijed izračunati bez ključa.
+            _hmacKey = Encoding.UTF8.GetBytes(config["Jwt:Key"]
+                ?? throw new InvalidOperationException("Jwt:Key nije postavljen."));
         }
 
-        public async Task CreateResetTokenAsync(int userId, string token)
+        private string HashCode(int userId, string code)
+        {
+            using var hmac = new HMACSHA256(_hmacKey);
+            // userId ulazi u hash pa isti kod kod dva korisnika daje različit zapis.
+            var bytes = hmac.ComputeHash(Encoding.UTF8.GetBytes($"{userId}:{code}"));
+            return Convert.ToHexString(bytes);
+        }
+
+        /// <summary>
+        /// Sprema novi kod (zamjenjuje stari). Vraća false ako je kod za ovog
+        /// korisnika već poslan unutar <see cref="ResendCooldown"/> — tada se
+        /// ništa ne mijenja i e-mail se ne šalje (zaštita od zatrpavanja
+        /// tuđeg sandučića zahtjevima za reset).
+        /// </summary>
+        public async Task<bool> CreateResetTokenAsync(int userId, string code)
         {
             using var conn = _db.CreateConnection();
+            var now = DateTime.UtcNow;
 
-            // Obriši stare tokene za ovog korisnika
-            await conn.ExecuteAsync(
-                "DELETE FROM password_reset_tokens WHERE user_id = @UserId",
+            var lastCreated = await conn.QueryFirstOrDefaultAsync<DateTime?>(
+                "SELECT created_at FROM password_reset_tokens WHERE user_id = @UserId",
                 new { UserId = userId });
+            if (lastCreated.HasValue && now - lastCreated.Value < ResendCooldown)
+                return false;
 
+            // Upsert (jedinstveni indeks na user_id): dva istovremena zahtjeva za
+            // istog korisnika ne smiju završiti greškom prije slanja e-maila.
             await conn.ExecuteAsync(@"
-                INSERT INTO password_reset_tokens (user_id, token, expires_at, created_at)
-                VALUES (@UserId, @Token, @ExpiresAt, @CreatedAt)",
+                INSERT INTO password_reset_tokens (user_id, token, expires_at, created_at, attempts)
+                VALUES (@UserId, @Token, @ExpiresAt, @CreatedAt, 0)
+                ON CONFLICT (user_id) DO UPDATE
+                SET token = EXCLUDED.token, expires_at = EXCLUDED.expires_at,
+                    created_at = EXCLUDED.created_at, attempts = 0",
                 new
                 {
                     UserId = userId,
-                    Token = token,
-                    ExpiresAt = DateTime.UtcNow.AddHours(1),
-                    CreatedAt = DateTime.UtcNow
+                    Token = HashCode(userId, code),
+                    ExpiresAt = now.AddHours(1),
+                    CreatedAt = now
                 });
+            return true;
         }
 
         /// <summary>
-        /// Najviše ovoliko pogrešnih pokušaja po kodu prije nego što se poništi.
-        /// </summary>
-        private const int MaxAttempts = 5;
-
-        /// <summary>
-        /// Provjeri kod za resetiranje lozinke.
+        /// Provjerava kod uz e-mail: kod mora pripadati baš tom korisniku.
         ///
-        /// Prije se kod tražio SAMO po vrijednosti, bez ikakve veze s korisnikom
-        /// koji ga koristi: tko god bi pogodio bilo koji živi šesteroznamenkasti
-        /// kod, resetirao bi lozinku onome kome taj kod pripada. Uz to nije
-        /// postojalo ograničenje broja pokušaja, pa se prostor od 900.000
-        /// kombinacija mogao pretraživati sve dok se ne pogodi.
-        ///
-        /// Sada kod mora pripadati baš onom korisniku čiji je e-mail unesen, a
-        /// svaki promašaj troši jedan od <see cref="MaxAttempts"/> pokušaja;
-        /// nakon toga se kod briše i mora se zatražiti novi.
+        /// Pokušaj se broji PRIJE usporedbe, u istoj atomarnoj naredbi koja
+        /// dohvaća zapis — pa paralelni zahtjevi ne mogu premašiti
+        /// <see cref="MaxAttempts"/> pogađanja. Istekao ili iscrpljen kod se
+        /// ne vraća uopće.
         /// </summary>
-        public async Task<(int UserId, bool IsValid)> ValidateTokenAsync(string token, string email)
+        public async Task<(int UserId, bool IsValid)> ValidateTokenAsync(string code, string email)
         {
             using var conn = _db.CreateConnection();
 
-            var result = await conn.QueryFirstOrDefaultAsync<ResetTokenResult>(@"
-        SELECT t.user_id AS UserId, t.expires_at AS ExpiresAt, COALESCE(t.attempts, 0) AS Attempts
-        FROM password_reset_tokens t
-        JOIN users u ON u.id = t.user_id
-        WHERE LOWER(u.email) = LOWER(@Email)",
-                new { Email = email });
+            var row = await conn.QueryFirstOrDefaultAsync<ResetRow>(@"
+                UPDATE password_reset_tokens t
+                SET attempts = t.attempts + 1
+                FROM users u
+                WHERE u.id = t.user_id
+                  AND LOWER(u.email) = LOWER(@Email)
+                  AND t.attempts < @MaxAttempts
+                  AND t.expires_at > @Now
+                RETURNING t.user_id AS UserId, t.token AS Token",
+                new { Email = email, MaxAttempts, Now = DateTime.UtcNow });
 
-            if (result == null)
+            if (row == null)
                 return (0, false);
 
-            if (result.ExpiresAt < DateTime.UtcNow || result.Attempts >= MaxAttempts)
-            {
-                await conn.ExecuteAsync(
-                    "DELETE FROM password_reset_tokens WHERE user_id = @UserId",
-                    new { result.UserId });
-                return (0, false);
-            }
+            var expected = HashCode(row.UserId, code);
+            var matches = CryptographicOperations.FixedTimeEquals(
+                Encoding.UTF8.GetBytes(row.Token), Encoding.UTF8.GetBytes(expected));
 
-            // Usporedba u konstantnom vremenu — kod je kratak, ali nema razloga
-            // da trajanje usporedbe odaje koliko je znamenki pogođeno.
-            var stored = await conn.QueryFirstOrDefaultAsync<string>(
-                "SELECT token FROM password_reset_tokens WHERE user_id = @UserId",
-                new { result.UserId });
-
-            var matches = stored != null && CryptographicOperations.FixedTimeEquals(
-                Encoding.UTF8.GetBytes(stored), Encoding.UTF8.GetBytes(token));
-
-            if (!matches)
-            {
-                await conn.ExecuteAsync(
-                    "UPDATE password_reset_tokens SET attempts = COALESCE(attempts, 0) + 1 WHERE user_id = @UserId",
-                    new { result.UserId });
-                return (0, false);
-            }
-
-            return (result.UserId, true);
+            return matches ? (row.UserId, true) : (0, false);
         }
 
-        public class ResetTokenResult
+        private class ResetRow
         {
             public int UserId { get; set; }
-            public DateTime ExpiresAt { get; set; }
-            public int Attempts { get; set; }
+            public string Token { get; set; } = "";
         }
-        public async Task DeleteTokenAsync(string token)
+
+        /// <summary>Briše kod korisnika (nakon uspješne promjene lozinke ili neuspjelog slanja).</summary>
+        public async Task DeleteTokensForUserAsync(int userId)
         {
             using var conn = _db.CreateConnection();
             await conn.ExecuteAsync(
-                "DELETE FROM password_reset_tokens WHERE token = @Token",
-                new { Token = token });
+                "DELETE FROM password_reset_tokens WHERE user_id = @UserId",
+                new { UserId = userId });
         }
     }
 }

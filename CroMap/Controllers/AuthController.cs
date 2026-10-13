@@ -173,12 +173,16 @@ namespace CroMap.Controllers
         {
             if (string.IsNullOrWhiteSpace(dto.Email))
                 return BadRequest(new { message = "Email je obavezan" });
+            // Trim: razmak na kraju (tipkovnice ga često dodaju nakon
+            // autocompletea) inače ne bi našao račun, a odgovor je uvijek 200
+            // — korisnik bi čekao e-mail koji nikad nije poslan.
+            var email = dto.Email.Trim();
             try
             {
                 using var conn = _dbConnection.CreateConnection();
                 var user = await conn.QueryFirstOrDefaultAsync<User>(
                     "SELECT id, first_name AS FirstName, email, language AS Language FROM users WHERE LOWER(email) = LOWER(@Email)",
-                    new { dto.Email });
+                    new { Email = email });
 
                 // Namjerno isti odgovor postoji li email ili ne (spriječi
                 // "user enumeration" — prije je 404 na nepostojeći email
@@ -192,13 +196,30 @@ namespace CroMap.Controllers
                     // koliko želi tražeći resetiranje za vlastiti račun).
                     var code = System.Security.Cryptography.RandomNumberGenerator
                         .GetInt32(100000, 1000000).ToString();
-                    await _resetRepo.CreateResetTokenAsync(user.Id, code);
-                    await SendEmailWithInlineImages(
-                        user.Email,
-                        T(lang, "resetSubject"),
-                        BuildResetEmail(user.FirstName, code, lang),
-                        GetLogoAttachments()
-                    );
+
+                    // Kod ide ISKLJUČIVO na adresu spremljenu uz račun (user.Email),
+                    // nikad na ono što je klijent poslao.
+                    if (await _resetRepo.CreateResetTokenAsync(user.Id, code))
+                    {
+                        try
+                        {
+                            await SendEmailWithInlineImages(
+                                user.Email,
+                                T(lang, "resetSubject"),
+                                BuildResetEmail(user.FirstName, code, lang),
+                                GetLogoAttachments()
+                            );
+                        }
+                        catch (Exception mailEx)
+                        {
+                            // Slanje nije uspjelo: kod koji nitko nije dobio ne
+                            // smije blokirati ponovni pokušaj (pauza između slanja).
+                            // Odgovor ostaje isti da se ne otkrije postoji li račun;
+                            // uzrok je u logu (EmailService bilježi SendGrid odgovor).
+                            _logger.LogError(mailEx, "Reset e-mail NIJE poslan korisniku {UserId}", user.Id);
+                            await _resetRepo.DeleteTokensForUserAsync(user.Id);
+                        }
+                    }
                 }
                 return Ok(new { message = "Ako email postoji, kod je poslan" });
             }
@@ -223,7 +244,7 @@ namespace CroMap.Controllers
             {
                 // Kod se provjerava uz e-mail: dosad je vrijedio bilo koji živi
                 // kod, bez obzira kojem korisniku pripada.
-                var (userId, isValid) = await _resetRepo.ValidateTokenAsync(dto.Code, dto.Email);
+                var (userId, isValid) = await _resetRepo.ValidateTokenAsync(dto.Code.Trim(), dto.Email.Trim());
                 if (!isValid)
                     return BadRequest(new { message = "Kod je neispravan ili je istekao" });
                 var hashedPassword = BCrypt.Net.BCrypt.HashPassword(dto.NewPassword);
@@ -231,7 +252,8 @@ namespace CroMap.Controllers
                 await conn.ExecuteAsync(
                     "UPDATE users SET password_hash = @Hash WHERE id = @Id",
                     new { Hash = hashedPassword, Id = userId });
-                await _resetRepo.DeleteTokenAsync(dto.Code);
+                // Briše se kod ovog korisnika (ne "svaki kod s istom vrijednošću").
+                await _resetRepo.DeleteTokensForUserAsync(userId);
                 return Ok(new { message = "Lozinka uspje\u0161no promijenjena" });
             }
             catch (Exception ex)

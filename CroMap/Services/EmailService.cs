@@ -27,6 +27,18 @@ namespace CroMap.Services
             var fromEmail = _config["Email__From"] ?? _config["Email:From"] ?? "adminvaraapp@gmail.com";
             var fromName = _config["Email__FromName"] ?? _config["Email:FromName"] ?? "VARA";
 
+            if (string.IsNullOrWhiteSpace(apiKey))
+                throw new InvalidOperationException("SendGrid__ApiKey nije postavljen — e-mail se ne može poslati.");
+
+            // Slanje "kao" @gmail.com adresa preko SendGrida ne prolazi DMARC
+            // (Gmail/Yahoo ih odbacuju ili tiho brišu, čak i iz spama) — pošiljatelj
+            // mora biti na vlastitoj domeni s autentikacijom u SendGridu.
+            if (fromEmail.EndsWith("@gmail.com", StringComparison.OrdinalIgnoreCase)
+                || fromEmail.EndsWith("@googlemail.com", StringComparison.OrdinalIgnoreCase))
+                _logger.LogWarning(
+                    "Email__From je {From} (besplatna adresa) — poruke će vjerojatno biti odbačene zbog DMARC-a. " +
+                    "Postavi adresu s vlastite domene i autentificiraj domenu u SendGridu.", fromEmail);
+
             var client = new SendGridClient(apiKey);
             var from = new EmailAddress(fromEmail, fromName);
             var toAddress = new EmailAddress(to);
