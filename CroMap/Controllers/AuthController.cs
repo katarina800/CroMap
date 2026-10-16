@@ -325,10 +325,13 @@ namespace CroMap.Controllers
                         {
                             // Slanje nije uspjelo: kod koji nitko nije dobio ne
                             // smije blokirati ponovni pokušaj (pauza između slanja).
-                            // Odgovor ostaje isti da se ne otkrije postoji li račun;
-                            // uzrok je u logu (EmailService bilježi SendGrid odgovor).
+                            // Uzrok je u logu (EmailService bilježi odgovor pružatelja).
                             _logger.LogError(mailEx, "Reset e-mail NIJE poslan korisniku {UserId}", user.Id);
                             await _resetRepo.DeleteForUserAsync(user.Id);
+                            // Korisniku se kaže istina (inače čeka poruku koja nikad
+                            // ne stiže). To otkriva da račun postoji, ali samo dok
+                            // pošta ne radi — napadač kvar ne može izazvati po želji.
+                            return StatusCode(503, new { code = "emailUnavailable" });
                         }
                     }
                 }
