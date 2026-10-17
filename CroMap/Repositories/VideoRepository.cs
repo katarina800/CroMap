@@ -1,4 +1,4 @@
-﻿using CroMap.Models;
+using CroMap.Models;
 using Dapper;
 using System.Data;
 using CroMap.Data;
@@ -60,8 +60,25 @@ namespace CroMap.Repositories
         ) cc ON v.id = cc.video_id
         LEFT JOIN likes ul ON v.id = ul.video_id AND ul.user_id = @CurrentUserId
         LEFT JOIN saved_videos sv ON v.id = sv.video_id AND sv.user_id = @CurrentUserId
+        LEFT JOIN follows fw ON fw.followed_id = v.user_id AND fw.follower_id = @CurrentUserId
         /**WHERE**/
-        ORDER BY v.created_at DESC
+        -- Objave ljudi koje pratiš idu više.
+        --
+        -- Feed je bio čisto kronološki, pa je praćenje nekoga značilo samo to
+        -- da mu se ime pojavi u popisu praćenih — na ono što vidiš nije
+        -- utjecalo ni najmanje.
+        --
+        -- Umjesto da se praćeni dignu iznad svega (čime bi objava od prošlog
+        -- mjeseca pretekla današnju), njihovoj se objavi doda tri dana
+        -- prednosti. Ostaje iznad nepraćenih sve dok ove nisu više od tri
+        -- dana svježije, a redoslijed i dalje ima smisla u vremenu.
+        ORDER BY (v.created_at + CASE WHEN fw.follower_id IS NOT NULL
+                                      THEN INTERVAL '3 days'
+                                      ELSE INTERVAL '0 days' END) DESC,
+                 -- Stabilan poredak za paginaciju: bez ovoga dvije objave s
+                 -- istim vremenom znaju zamijeniti mjesta između stranica i
+                 -- tada se jedna pojavi dvaput, a druga nikad.
+                 v.id DESC
         LIMIT @PageSize OFFSET @Offset";
 
             var areaList = areas?.ToList() ?? new List<(double Lat, double Lon)>();

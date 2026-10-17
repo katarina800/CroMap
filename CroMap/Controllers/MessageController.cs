@@ -14,10 +14,13 @@ namespace CroMap.Controllers
     public class MessageController : ControllerBase
     {
         private readonly IMessageRepository _messageRepository;
+        // Greške idu u zapisnik; klijent dobiva samo da nije uspjelo.
+        private readonly ILogger<MessageController> _logger;
 
-        public MessageController(IMessageRepository messageRepository)
+        public MessageController(IMessageRepository messageRepository, ILogger<MessageController> logger)
         {
             _messageRepository = messageRepository;
+            _logger = logger;
         }
 
         private int GetCurrentUserId()
@@ -65,7 +68,9 @@ namespace CroMap.Controllers
             catch (Exception ex)
             {
                 Console.WriteLine($"SendMessage error: {ex.Message}");
-                return StatusCode(500, new { message = "Failed to send message", detail = ex.Message });
+                // "detail" je nosio poruku iznimke ravno klijentu.
+                _logger.LogError(ex, "Slanje poruke nije uspjelo.");
+                return StatusCode(500, new { message = "Failed to send message" });
             }
         }
 

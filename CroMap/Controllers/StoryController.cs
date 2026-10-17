@@ -16,11 +16,14 @@ namespace CroMap.Controllers
     {
         private readonly IStoryRepository _storyRepository;
         private readonly DatabaseConnection _dbConnection;
+        // Greške idu u zapisnik; klijent dobiva samo da nije uspjelo.
+        private readonly ILogger<StoryController> _logger;
 
-        public StoryController(IStoryRepository storyRepository, DatabaseConnection dbConnection)
+        public StoryController(IStoryRepository storyRepository, DatabaseConnection dbConnection, ILogger<StoryController> logger)
         {
             _storyRepository = storyRepository;
             _dbConnection = dbConnection;
+            _logger = logger;
         }
 
         private int GetCurrentUserId()
@@ -48,7 +51,8 @@ namespace CroMap.Controllers
             }
             catch (Exception ex)
             {
-                return BadRequest(new { message = ex.Message });
+                _logger.LogError(ex, "Objava priče nije uspjela.");
+                return StatusCode(500, new { message = "Could not save the story." });
             }
         }
 

@@ -48,12 +48,15 @@ namespace CroMap.Controllers
         }
 
         // GET: api/video?page=1&pageSize=15&scope=local|global&radiusKm=50
+        //      &lat=45.55&lon=18.69   (objave oko zadane točke)
         [HttpGet]
         public async Task<ActionResult<IEnumerable<Video>>> GetAllVideos(
             [FromQuery] int page = 1,
             [FromQuery] int pageSize = 15,
             [FromQuery] string scope = "global",
-            [FromQuery] double radiusKm = 50)
+            [FromQuery] double radiusKm = 50,
+            [FromQuery] double? lat = null,
+            [FromQuery] double? lon = null)
         {
             var currentUserId = GetCurrentUserId();
             pageSize = Math.Clamp(pageSize, 1, 50);
@@ -61,7 +64,18 @@ namespace CroMap.Controllers
             radiusKm = Math.Clamp(radiusKm, 1, 500);
 
             List<(double Lat, double Lon)>? areas = null;
-            if (scope == "local" && currentUserId.HasValue)
+
+            // Zadana točka ima prednost pred "blizu mene".
+            //
+            // Kad korisnik na karti potraži drugi grad, zanima ga što se
+            // događa TAMO, a ne u krajevima u kojima se inače kreće. Filtar
+            // po udaljenosti je isti, mijenja se samo od čega se mjeri — pa
+            // ovdje nema nove logike, samo druga polazišna točka.
+            if (lat.HasValue && lon.HasValue)
+            {
+                areas = new List<(double Lat, double Lon)> { (lat.Value, lon.Value) };
+            }
+            else if (scope == "local" && currentUserId.HasValue)
             {
                 var top = await _userAreas.GetTopAreasAsync(currentUserId.Value);
                 areas = top.Select(a => (a.CellLat, a.CellLon)).ToList();

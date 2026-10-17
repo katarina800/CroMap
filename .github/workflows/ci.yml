@@ -1,0 +1,39 @@
+# Prevodi li se backend uopće — provjera na svaki push i pull request.
+#
+# Dosad nije postojala nikakva automatska provjera, pa se greška u kodu
+# vidjela tek kad bi Render pokušao deploy s grane main. To je najgore
+# mjesto za saznati: produkcija je tada već pala.
+#
+# Namjerno samo restore + build, bez `dotnet format --verify-no-changes`:
+# formatiranje bi na postojećem kodu vjerojatno odmah pocrvenjelo, a CI
+# koji je crven od prvog dana nitko ne gleda. Kad kod prođe `dotnet
+# format`, provjera se može dodati.
+name: CI
+
+on:
+  push:
+    branches: ["**"]
+  pull_request:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-dotnet@v4
+        with:
+          dotnet-version: "9.0.x"
+
+      - name: Restore
+        run: dotnet restore CroMap.sln
+
+      # --no-restore jer je restore već gotov; inače se vrti dvaput.
+      - name: Build
+        run: dotnet build CroMap.sln --configuration Release --no-restore

@@ -15,6 +15,17 @@
 --      psql "<Render External Database URL>" -f migracija_obavijesti.sql
 -- ============================================================================
 
+-- UPOZORENJE nauceno na teži način:
+-- "CREATE TABLE IF NOT EXISTS" gleda SAMO ime tablice. Ako tablica tog imena
+-- već postoji u drugom obliku (starija shema, ručno napravljena), naredba se
+-- tiho preskoči i stupci koje kod očekuje nikad ne nastanu. Upisi onda pucaju
+-- na "column ... does not exist".
+--
+-- Ako si ovo pokrenula, a obavijesti ne rade, provjeri OBLIK tablice:
+--   SELECT column_name FROM information_schema.columns
+--   WHERE table_name = 'notifications' ORDER BY ordinal_position;
+-- i po potrebi pokreni popravak_tablice_obavijesti.sql.
+
 BEGIN;
 
 -- ─── Postavke obavijesti po korisniku ────────────────────────────────────────

@@ -17,4 +17,12 @@
     <PackageReference Include="Swashbuckle.AspNetCore" Version="10.1.5" />
   </ItemGroup>
 
+  <!-- SQL migracije moraju završiti pokraj binarnog izlaza: pokretač ih
+       na Renderu čita s diska, a ne iz resursa. -->
+  <ItemGroup>
+    <Content Include="Migrations/*.sql">
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+    </Content>
+  </ItemGroup>
+
 </Project>

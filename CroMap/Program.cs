@@ -275,6 +275,26 @@ app.UseStaticFiles(new StaticFileOptions
 
 app.MapControllers();
 
+// Migracije baze — PRIJE svega ostalog što dira bazu.
+//
+// Dosad su se pokretale ručno, lijepljenjem u pgAdmin, pa nigdje nije pisalo
+// što je produkcija stvarno vidjela. Tako je i nastao slučaj u kojem je
+// tablica "notifications" postojala u starijem obliku, CREATE TABLE IF NOT
+// EXISTS ju je preskočio (jer gleda samo ime), a svaka obavijest je zatim
+// padala na stupac koji ne postoji — bez ijedne greške pri pokretanju.
+//
+// Ako migracija padne, aplikacija se namjerno NE diže: bolje vidljiv pad pri
+// deployu nego poslužitelj koji radi nad polovično migriranom bazom.
+using (var scope = app.Services.CreateScope())
+{
+    var migrator = new CroMap.Data.DatabaseMigrator(
+        app.Configuration.GetConnectionString("DefaultConnection")!,
+        Path.Combine(AppContext.BaseDirectory, "Migrations"),
+        scope.ServiceProvider.GetRequiredService<ILogger<CroMap.Data.DatabaseMigrator>>());
+
+    await migrator.MigrateAsync();
+}
+
 // Seed admin korisnika
 using (var scope = app.Services.CreateScope())
 {
