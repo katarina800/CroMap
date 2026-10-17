@@ -1,4 +1,6 @@
 ﻿using System.Net;
+using System.Net.Http.Headers;
+using System.Net.Http.Json;
 using System.Net.Mail;
 using SendGrid;
 using SendGrid.Helpers.Mail;
@@ -9,6 +11,10 @@ namespace CroMap.Services
     {
         private readonly IConfiguration _config;
         private readonly ILogger<EmailService> _logger;
+
+        // Jedan HttpClient za sve zahtjeve (ne stvara nove utičnice pri svakom slanju);
+        // kratak timeout da korisnik ne čeka minutama kad pružatelj ne odgovara.
+        private static readonly HttpClient Http = new() { Timeout = TimeSpan.FromSeconds(20) };
 
         public EmailService(IConfiguration config, ILogger<EmailService> logger)
         {
@@ -25,32 +31,99 @@ namespace CroMap.Services
             string to, string subject, string htmlBody,
             List<InlineImageAttachment> inlineImages)
         {
-            // Dva puta: prvo SendGrid; ako ga račun odbije (npr. "Maximum credits
-            // exceeded" kad se potroši besplatna kvota) ili nema ključa, pokušava se
-            // SMTP (Smtp__Host/User/Password) — npr. Gmail s lozinkom aplikacije ili
-            // Brevo. Bez ijednog postavljenog pružatelja slanje vraća grešku.
-            var apiKey = _config["SendGrid__ApiKey"] ?? _config["SendGrid:ApiKey"] ?? "";
+            // Pružatelji, redom: Brevo (HTTPS API), SendGrid (HTTPS API), SMTP.
+            // Prvi koji uspije šalje poruku; ako padne, pokušava se sljedeći.
+            //
+            // Preporuka za Render: koristi API (Brevo__ApiKey ili SendGrid__ApiKey).
+            // Besplatne Render instance blokiraju izlazni SMTP (portovi 25/465/587),
+            // pa SMTP tamo završi s "Connection timed out".
+            var providers = new List<(string Name, Func<Task> Send)>();
+
+            var brevoKey = _config["Brevo__ApiKey"] ?? _config["Brevo:ApiKey"] ?? "";
+            if (!string.IsNullOrWhiteSpace(brevoKey))
+                providers.Add(("Brevo", () => SendViaBrevoAsync(brevoKey, to, subject, htmlBody, inlineImages)));
+
+            var sendGridKey = _config["SendGrid__ApiKey"] ?? _config["SendGrid:ApiKey"] ?? "";
+            if (!string.IsNullOrWhiteSpace(sendGridKey))
+                providers.Add(("SendGrid", () => SendViaSendGridAsync(sendGridKey, to, subject, htmlBody, inlineImages)));
+
             var smtpHost = _config["Smtp__Host"] ?? _config["Smtp:Host"] ?? "";
-            var smtpConfigured = !string.IsNullOrWhiteSpace(smtpHost);
+            if (!string.IsNullOrWhiteSpace(smtpHost))
+                providers.Add(("SMTP", () => SendViaSmtpAsync(to, subject, htmlBody, inlineImages)));
 
-            if (string.IsNullOrWhiteSpace(apiKey))
+            if (providers.Count == 0)
+                throw new InvalidOperationException(
+                    "Nije postavljen nijedan pružatelj e-pošte (Brevo__ApiKey, SendGrid__ApiKey ili Smtp__Host).");
+
+            Exception? last = null;
+            foreach (var (name, send) in providers)
             {
-                if (!smtpConfigured)
-                    throw new InvalidOperationException(
-                        "Nije postavljen ni SendGrid__ApiKey ni Smtp__Host — e-mail se ne može poslati.");
-                await SendViaSmtpAsync(to, subject, htmlBody, inlineImages);
-                return;
+                try
+                {
+                    await send();
+                    return;
+                }
+                catch (Exception ex)
+                {
+                    last = ex;
+                    _logger.LogWarning(ex, "{Provider} nije poslao poruku.", name);
+                }
             }
 
-            try
+            throw new Exception("Nijedan pružatelj e-pošte nije poslao poruku.", last);
+        }
+
+        /// <summary>
+        /// Brevo transakcijski API (HTTPS, port 443 — radi i na besplatnom Renderu).
+        /// Pošiljatelj (Email__From) MORA biti potvrđen u Brevu (Senders, domains, IPs).
+        /// Brevo ne podržava CID slike u tijelu poruke, pa se "cid:..." zamjenjuje
+        /// javnim adresama logotipa s ovog poslužitelja (wwwroot/images).
+        /// </summary>
+        private async Task SendViaBrevoAsync(
+            string apiKey, string to, string subject, string htmlBody, List<InlineImageAttachment> inlineImages)
+        {
+            var fromEmail = _config["Email__From"] ?? _config["Email:From"] ?? "";
+            var fromName = _config["Email__FromName"] ?? _config["Email:FromName"] ?? "VARA";
+            if (string.IsNullOrWhiteSpace(fromEmail))
+                throw new InvalidOperationException(
+                    "Email__From nije postavljen — mora biti pošiljatelj potvrđen u Brevu.");
+
+            var baseUrl = (_config["Email__PublicBaseUrl"] ?? _config["Email:PublicBaseUrl"]
+                           ?? "https://cromap.onrender.com").TrimEnd('/');
+
+            var html = htmlBody;
+            foreach (var img in inlineImages)
             {
-                await SendViaSendGridAsync(apiKey, to, subject, htmlBody, inlineImages);
+                var file = img.ContentId switch
+                {
+                    "vara_logo_80" => "vara_email_80.png",
+                    "vara_logo_36" => "vara_email_36.png",
+                    _ => null
+                };
+                if (file != null)
+                    html = html.Replace("cid:" + img.ContentId, $"{baseUrl}/images/{file}");
             }
-            catch (Exception ex) when (smtpConfigured)
+
+            using var request = new HttpRequestMessage(HttpMethod.Post, "https://api.brevo.com/v3/smtp/email");
+            request.Headers.Add("api-key", apiKey);
+            request.Headers.Accept.Add(new MediaTypeWithQualityHeaderValue("application/json"));
+            request.Content = JsonContent.Create(new
             {
-                _logger.LogWarning(ex, "SendGrid nije poslao poruku — pokušavam SMTP.");
-                await SendViaSmtpAsync(to, subject, htmlBody, inlineImages);
+                sender = new { name = fromName, email = fromEmail },
+                to = new[] { new { email = to } },
+                subject,
+                htmlContent = html
+            });
+
+            using var response = await Http.SendAsync(request);
+            if (!response.IsSuccessStatusCode)
+            {
+                var body = await response.Content.ReadAsStringAsync();
+                _logger.LogError("Brevo error {Status}: {Body}", (int)response.StatusCode, body);
+                throw new Exception($"Brevo failed: {(int)response.StatusCode}");
             }
+
+            _logger.LogInformation("Email sent via Brevo to {To}", to);
         }
 
         private async Task SendViaSmtpAsync(
