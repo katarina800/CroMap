@@ -735,27 +735,3 @@ CREATE TRIGGER trigger_track_comments
     AFTER INSERT OR DELETE ON comments
     FOR EACH ROW
     EXECUTE FUNCTION track_comment_activity();
-
-
-SELECT COUNT(*) FROM follow_requests;                          -- a number, not an error
-SELECT attempts FROM password_reset_tokens LIMIT 1;            -- column exists
-SELECT SUM(likes), SUM(comments) FROM activity_logs;           -- no longer all zero
-
-
-
-
-CREATE ROLE vara_app WITH LOGIN PASSWORD '<new strong password>';
-GRANT ALL PRIVILEGES ON DATABASE <dbname> TO vara_app;
-GRANT ALL PRIVILEGES ON ALL TABLES IN SCHEMA public TO vara_app;
-GRANT ALL PRIVILEGES ON ALL SEQUENCES IN SCHEMA public TO vara_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON TABLES TO vara_app;
-ALTER DEFAULT PRIVILEGES IN SCHEMA public GRANT ALL ON SEQUENCES TO vara_app;
-
-ALTER TABLE password_reset_tokens
-    ADD COLUMN IF NOT EXISTS attempts INTEGER NOT NULL DEFAULT 0;
-
-
-SELECT column_name, data_type, column_default
-FROM information_schema.columns
-WHERE table_name = 'password_reset_tokens'
-ORDER BY ordinal_position;
