@@ -1,9 +1,8 @@
 -- ----------------------------------------------------------------------------
 -- Reset lozinke, potvrda e-maila i odjava sa svih uređaja.
 -- Sigurno za ponovno pokretanje (sve je IF NOT EXISTS / provjereno).
--- Pokrenuti PRIJE deploya nove verzije API-ja.
+-- Pokreće ga DatabaseMigrator pri dizanju (u vlastitoj transakciji, pa ovdje nema BEGIN/COMMIT).
 -- ----------------------------------------------------------------------------
-BEGIN;
 
 -- ============================================================================
 -- 1) Reset lozinke: kodovi se spremaju kao HMAC hash (64 znaka), ne kao
@@ -68,5 +67,3 @@ CREATE TABLE IF NOT EXISTS email_verification_codes (
     created_at TIMESTAMP   NOT NULL DEFAULT NOW(),
     attempts   INTEGER     NOT NULL DEFAULT 0
 );
-
-COMMIT;
