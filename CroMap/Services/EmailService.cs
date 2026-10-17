@@ -139,7 +139,7 @@ namespace CroMap.Services
             // Inline slike kao attachmenti s Content-ID
             foreach (var img in inlineImages)
             {
-                msg.AddAttachment(new Attachment
+                msg.AddAttachment(new SendGrid.Helpers.Mail.Attachment
                 {
                     Content = img.Base64Data,
                     Type = img.MimeType,
