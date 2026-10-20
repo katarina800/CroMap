@@ -96,6 +96,10 @@ builder.Services.AddScoped<IBlockRepository, BlockRepository>();
 builder.Services.AddScoped<IActivityRepository, ActivityRepository>();
 builder.Services.AddScoped<INotificationRepository, NotificationRepository>();
 builder.Services.AddScoped<IUserAreaRepository, UserAreaRepository>();
+// Singleton: ne drže ništa vezano uz zahtjev, a push se šalje i iz pozadinskih
+// zadataka koji nadžive zahtjev (npr. razašiljanje obavijesti nakon objave).
+builder.Services.AddSingleton<IPushTokenRepository, PushTokenRepository>();
+builder.Services.AddSingleton<IExpoPushService, ExpoPushService>();
 builder.Services.AddScoped<MediaRepository>();
 builder.Services.AddScoped<AdminRepository>();
 builder.Services.AddScoped<IEmailService, EmailService>();

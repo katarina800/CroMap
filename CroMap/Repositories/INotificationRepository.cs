@@ -19,7 +19,8 @@ namespace CroMap.Repositories
         /// je objava blizu (ili da prate autora, ili primaju sadržaj odasvud).
         /// </summary>
         /// <param name="latitude">Položaj objave; null kad ga nema.</param>
-        Task<int> FanOutNewActivityAsync(
+        /// <returns>Id-evi korisnika kojima je obavijest napravljena (za push).</returns>
+        Task<IReadOnlyList<int>> FanOutNewActivityAsync(
             int actorUserId,
             int videoId,
             string title,

@@ -1,6 +1,7 @@
 using System.Security.Claims;
 using CroMap.Models;
 using CroMap.Repositories;
+using CroMap.Services;
 using Microsoft.AspNetCore.Authorization;
 using Microsoft.AspNetCore.Mvc;
 
@@ -12,13 +13,16 @@ namespace CroMap.Controllers
     public class NotificationController : ControllerBase
     {
         private readonly INotificationRepository _repository;
+        private readonly IPushTokenRepository _pushTokens;
         private readonly ILogger<NotificationController> _logger;
 
         public NotificationController(
             INotificationRepository repository,
+            IPushTokenRepository pushTokens,
             ILogger<NotificationController> logger)
         {
             _repository = repository;
+            _pushTokens = pushTokens;
             _logger = logger;
         }
 
@@ -29,6 +33,46 @@ namespace CroMap.Controllers
                 var raw = User.FindFirst(ClaimTypes.NameIdentifier)?.Value;
                 return int.TryParse(raw, out var id) ? (int?)id : null;
             }
+        }
+
+        public class PushTokenRequest
+        {
+            public string Token { get; set; } = string.Empty;
+            public string? Platform { get; set; }
+        }
+
+        // POST: api/notification/push-token
+        // Aplikacija javlja Expo push token uređaja nakon prijave.
+        [HttpPost("push-token")]
+        public async Task<IActionResult> RegisterPushToken([FromBody] PushTokenRequest request)
+        {
+            var userId = CurrentUserId;
+            if (userId is null) return Unauthorized();
+
+            var token = request?.Token?.Trim();
+            if (!ExpoPushService.IsValidToken(token))
+                return BadRequest(new { message = "Invalid push token" });
+
+            var platform = request?.Platform;
+            if (platform != null && platform.Length > 20) platform = platform.Substring(0, 20);
+
+            await _pushTokens.UpsertAsync(userId.Value, token!, platform);
+            return Ok(new { registered = true });
+        }
+
+        // DELETE: api/notification/push-token?token=ExponentPushToken[...]
+        // Pri odjavi: uređaj više ne smije primati obavijesti ovog računa.
+        [HttpDelete("push-token")]
+        public async Task<IActionResult> UnregisterPushToken([FromQuery] string token)
+        {
+            var userId = CurrentUserId;
+            if (userId is null) return Unauthorized();
+
+            if (!ExpoPushService.IsValidToken(token))
+                return BadRequest(new { message = "Invalid push token" });
+
+            await _pushTokens.RemoveAsync(userId.Value, token.Trim());
+            return Ok(new { removed = true });
         }
 
         // GET: api/notification?limit=30&offset=0

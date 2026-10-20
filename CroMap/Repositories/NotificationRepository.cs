@@ -141,7 +141,7 @@ namespace CroMap.Repositories
                 });
         }
 
-        public async Task<int> FanOutNewActivityAsync(
+        public async Task<IReadOnlyList<int>> FanOutNewActivityAsync(
             int actorUserId,
             int videoId,
             string title,
@@ -151,7 +151,7 @@ namespace CroMap.Repositories
             double? longitude = null)
         {
             var list = NormalizeCategories(categories);
-            if (list.Length == 0) return 0;
+            if (list.Length == 0) return Array.Empty<int>();
 
             using var connection = _dbConnection.CreateConnection();
 
@@ -164,9 +164,10 @@ namespace CroMap.Repositories
                 SELECT p.user_id, @ActorUserId, 'new_activity', @Title, @Body, @Category, @VideoId
                 FROM notification_preferences p
                 WHERE p.app_enabled = TRUE
-                  AND " + InterestedUsersWhere;
+                  AND " + InterestedUsersWhere + @"
+                RETURNING user_id";
 
-            return await connection.ExecuteAsync(sql, new
+            var recipients = await connection.QueryAsync<int>(sql, new
             {
                 ActorUserId = actorUserId,
                 VideoId = videoId,
@@ -177,6 +178,7 @@ namespace CroMap.Repositories
                 Latitude = latitude,
                 Longitude = longitude,
             });
+            return recipients.ToList();
         }
 
         public async Task<IEnumerable<NotificationEmailRecipient>> GetEmailRecipientsAsync(

@@ -24,6 +24,7 @@ namespace CroMap.Controllers
         private readonly DatabaseConnection _dbConnection;
         private readonly IEmailService _emailService;
         private readonly PasswordResetRepository _resetRepo;
+        private readonly IServiceScopeFactory _scopeFactory;
 
         // ─── VARA logo: CID inline embedding ─────────────────────────────────
         private const string _logo80Cid = "vara_logo_80";
@@ -58,8 +59,10 @@ namespace CroMap.Controllers
         };
 
         public AuthController(UserRepository repo, IConfiguration configuration, ILogger<AuthController> logger,
-            DatabaseConnection dbConnection, IEmailService emailService, PasswordResetRepository resetRepo)
+            DatabaseConnection dbConnection, IEmailService emailService, PasswordResetRepository resetRepo,
+            IServiceScopeFactory scopeFactory)
         {
+            _scopeFactory = scopeFactory;
             _repo = repo;
             _configuration = configuration;
             _logger = logger;
@@ -866,6 +869,145 @@ namespace CroMap.Controllers
                 _logger.LogError(ex, "SetPassword error");
                 return StatusCode(500, new { message = "Greška pri postavljanju lozinke" });
             }
+        }
+
+        // ─── Brisanje računa ──────────────────────────────────────────────────
+        //
+        // Aplikacija već poziva DELETE /api/auth/delete-account (Profil →
+        // Obriši račun), ali ta ruta nije postojala — svaki pokušaj brisanja
+        // završavao je greškom. Google Play (i GDPR, pravo na brisanje) traži da
+        // brisanje računa unutar aplikacije stvarno radi.
+        //
+        // Gotovo sve tablice imaju ON DELETE CASCADE prema users, pa se redovi
+        // brišu sami. Ručno se čiste samo tablice koje se na korisnika ne vežu
+        // vanjskim ključem (blokade, dnevnik aktivnosti, grupe i njihove poruke) i
+        // anonimiziraju se zapisi koji čuvaju samo ime (ocjene plana, prijave
+        // podrške). Datoteke s R2 pohrane brišu se nakon uspjeha, u pozadini.
+        [Authorize]
+        [HttpDelete("delete-account")]
+        public async Task<IActionResult> DeleteAccount()
+        {
+            var idClaim = User.FindFirst(ClaimTypes.NameIdentifier) ?? User.FindFirst("sub");
+            if (idClaim == null || !int.TryParse(idClaim.Value, out int userId))
+                return Unauthorized(new { message = "Not authenticated" });
+
+            List<string> mediaPaths;
+            try
+            {
+                using var connection = _dbConnection.CreateConnection();
+                connection.Open();
+                using var tx = connection.BeginTransaction();
+
+                var identity = await connection.QueryFirstOrDefaultAsync<AccountIdentity>(
+                    "SELECT username AS Username, first_name AS FirstName, last_name AS LastName FROM users WHERE id = @U",
+                    new { U = userId }, tx);
+                if (identity == null)
+                    return NotFound(new { message = "User not found" });
+
+                // Putanje datoteka treba pročitati PRIJE brisanja redaka.
+                mediaPaths = new List<string>();
+                async Task CollectAsync(string sql)
+                {
+                    var rows = await TryQueryAsync<string>(connection, tx, sql, new { U = userId });
+                    mediaPaths.AddRange(rows.Where(p => !string.IsNullOrWhiteSpace(p)));
+                }
+                await CollectAsync("SELECT file_path FROM videos WHERE user_id = @U");
+                await CollectAsync("SELECT thumbnail_path FROM videos WHERE user_id = @U");
+                await CollectAsync("SELECT media_url FROM stories WHERE user_id = @U");
+                await CollectAsync("SELECT avatar FROM user_profiles WHERE user_id = @U");
+                await CollectAsync("SELECT \"MediaUrl\" FROM messages WHERE sender_id = @U AND \"MediaUrl\" IS NOT NULL");
+
+                // Tablice bez vanjskog ključa. Svaka ide u vlastitu "savepoint"
+                // točku: ako neka tablica na nekom okruženju ne postoji, to ne
+                // smije poništiti cijelo brisanje.
+                var fullName = $"{identity.FirstName} {identity.LastName}".Trim();
+                await TryExecAsync(connection, tx, "DELETE FROM blocks WHERE user_id = @U OR blocked_user_id = @U", new { U = userId });
+                await TryExecAsync(connection, tx, "DELETE FROM activity_logs WHERE user_id = @U", new { U = userId });
+                await TryExecAsync(connection, tx, "DELETE FROM group_messages WHERE user_id = @U", new { U = userId });
+                await TryExecAsync(connection, tx, "DELETE FROM activity_groups WHERE creator_user_id = @U", new { U = userId });
+                await TryExecAsync(connection, tx, "UPDATE support_reports SET user_name = NULL, username = NULL WHERE username = @Username", new { identity.Username });
+                if (fullName.Length > 0)
+                    await TryExecAsync(connection, tx, "UPDATE plan_ratings SET user_name = 'Obrisani korisnik' WHERE user_name = @FullName", new { FullName = fullName });
+
+                var deleted = await connection.ExecuteAsync("DELETE FROM users WHERE id = @U", new { U = userId }, tx);
+                if (deleted == 0)
+                    return NotFound(new { message = "User not found" });
+
+                tx.Commit();
+            }
+            catch (Exception ex)
+            {
+                _logger.LogError(ex, "DeleteAccount error for user {UserId}", userId);
+                return StatusCode(500, new { message = "Greška pri brisanju računa" });
+            }
+
+            // Datoteke se brišu u pozadini i u vlastitom "scopeu": zahtjev je do
+            // tada gotov, a R2 klijent je vezan uz njegov životni vijek.
+            if (mediaPaths.Count > 0)
+                _ = Task.Run(() => DeleteMediaFilesAsync(mediaPaths, userId));
+
+            _logger.LogInformation("Account {UserId} deleted", userId);
+            return Ok(new { message = "Account deleted" });
+        }
+
+        private async Task DeleteMediaFilesAsync(List<string> paths, int userId)
+        {
+            try
+            {
+                using var scope = _scopeFactory.CreateScope();
+                var storage = scope.ServiceProvider.GetRequiredService<IR2StorageService>();
+                foreach (var path in paths.Distinct())
+                {
+                    try { await storage.DeleteFileAsync(path); }
+                    catch (Exception ex)
+                    {
+                        _logger.LogWarning(ex, "Could not delete file {Path} of deleted user {UserId}", path, userId);
+                    }
+                }
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Media cleanup failed for deleted user {UserId}", userId);
+            }
+        }
+
+        private async Task TryExecAsync(System.Data.IDbConnection connection, System.Data.IDbTransaction tx, string sql, object args)
+        {
+            await connection.ExecuteAsync("SAVEPOINT cleanup_step", transaction: tx);
+            try
+            {
+                await connection.ExecuteAsync(sql, args, tx);
+                await connection.ExecuteAsync("RELEASE SAVEPOINT cleanup_step", transaction: tx);
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Account cleanup step skipped: {Sql}", sql);
+                await connection.ExecuteAsync("ROLLBACK TO SAVEPOINT cleanup_step", transaction: tx);
+            }
+        }
+
+        private async Task<IEnumerable<T>> TryQueryAsync<T>(System.Data.IDbConnection connection, System.Data.IDbTransaction tx, string sql, object args)
+        {
+            await connection.ExecuteAsync("SAVEPOINT collect_step", transaction: tx);
+            try
+            {
+                var rows = await connection.QueryAsync<T>(sql, args, tx);
+                await connection.ExecuteAsync("RELEASE SAVEPOINT collect_step", transaction: tx);
+                return rows;
+            }
+            catch (Exception ex)
+            {
+                _logger.LogWarning(ex, "Account media lookup skipped: {Sql}", sql);
+                await connection.ExecuteAsync("ROLLBACK TO SAVEPOINT collect_step", transaction: tx);
+                return Enumerable.Empty<T>();
+            }
+        }
+
+        private sealed class AccountIdentity
+        {
+            public string? Username { get; set; }
+            public string? FirstName { get; set; }
+            public string? LastName { get; set; }
         }
 
         public class SetPasswordDto

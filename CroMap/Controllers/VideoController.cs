@@ -18,6 +18,7 @@ namespace CroMap.Controllers
         private readonly INotificationRepository _notifications;
         private readonly IUserAreaRepository _userAreas;
         private readonly IEmailService _emailService;
+        private readonly IExpoPushService _push;
         private readonly ILogger<VideoController> _logger;
 
         public VideoController(
@@ -26,8 +27,10 @@ namespace CroMap.Controllers
             INotificationRepository notifications,
             IUserAreaRepository userAreas,
             IEmailService emailService,
+            IExpoPushService push,
             ILogger<VideoController> logger)
         {
+            _push = push;
             _videoRepository = videoRepository;
             _storageService = storageService;
             _notifications = notifications;
@@ -172,12 +175,26 @@ namespace CroMap.Controllers
             // Dohvati video prije brisanja da znamo file path za R2 cleanup
             var video = await _videoRepository.GetVideoByIdAsync(id, currentUserId);
 
+            // Ništa za brisati (već obrisano): brisanje je idempotentno.
+            if (video == null)
+                return Ok(new { message = "Video deleted successfully." });
+
+            // Vlasništvo se provjerava PRIJE bilo kakvog brisanja. Red u bazi je
+            // i prije bio zaštićen (DELETE ... WHERE user_id = @UserId), ali se
+            // datoteka u pohrani brisala za svaki id koji je poslan — pa je svaki
+            // prijavljeni korisnik mogao obrisati tuđu datoteku, a tuđa objava
+            // bi ostala u bazi s pokvarenom poveznicom.
+            if (video.UserId != currentUserId.Value)
+                return StatusCode(StatusCodes.Status403Forbidden,
+                    new { message = "You can only delete your own videos." });
+
             await _videoRepository.DeleteVideoAsync(id, currentUserId.Value);
 
-            // Pokušaj obrisati i fajl s R2 (best effort, ne blokira response)
-            if (video != null && !string.IsNullOrWhiteSpace(video.FilePath))
+            // Pokušaj obrisati i fajlove s R2 (best effort, ne blokira response)
+            foreach (var path in new[] { video.FilePath, video.ThumbnailPath })
             {
-                _ = _storageService.DeleteFileAsync(video.FilePath);
+                if (!string.IsNullOrWhiteSpace(path))
+                    _ = _storageService.DeleteFileAsync(path);
             }
 
             return Ok(new { message = "Video deleted successfully." });
@@ -304,9 +321,16 @@ namespace CroMap.Controllers
                 // Položaj objave odlučuje kome je "blizu". Bez njega obavijest
                 // ide svima koje kategorija zanima — radije previše nego da
                 // objava bez koordinata nikome ne stigne.
-                await _notifications.FanOutNewActivityAsync(
+                var notifiedUserIds = await _notifications.FanOutNewActivityAsync(
                     video.UserId, video.Id, title, body, categories,
                     video.Latitude, video.Longitude);
+
+                // Push na uređaje istih korisnika. Obavijest u aplikaciji je već
+                // spremljena; push je samo "kucanje na vrata" kad aplikacija nije
+                // otvorena, pa njegov neuspjeh ništa ne kvari.
+                await _push.SendAsync(
+                    notifiedUserIds, title, body,
+                    new { type = "new_activity", videoId = video.Id });
 
                 var recipients = await _notifications.GetEmailRecipientsAsync(
                     video.UserId, categories, video.Latitude, video.Longitude);
